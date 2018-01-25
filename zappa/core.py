@@ -305,8 +305,10 @@ class Zappa:
         if load_credentials:
             self.load_credentials(boto_session, profile_name)
 
+            from botocore.config import Config
             # Initialize clients
-            self.s3_client = self.boto_client('s3')
+            self.s3_client = self.boto_session.client('s3', config=Config(
+                signature_version='s3v4'))
             self.lambda_client = self.boto_client('lambda', config=long_config)
             self.elbv2_client = self.boto_client('elbv2')
             self.events_client = self.boto_client('events')
@@ -1312,6 +1314,29 @@ class Zappa:
             FunctionName=function_name,
         )
 
+    def remove_old_version_lambda_functions(self, lambda_name):
+        """
+        Deletes un tagged old versions from lambda function
+        :param lambda_name lambda function name:
+        :return:
+        """
+        versions_response = self.lambda_client.list_versions_by_function(
+            FunctionName=lambda_name)
+        available_versions_list = []
+        for version in versions_response['Versions']:
+            available_versions_list.append(version['Version'])
+        aliases_response = self.lambda_client.list_aliases(
+            FunctionName=lambda_name)
+        aliased_versions_list = []
+        for alias in aliases_response['Aliases']:
+            aliased_versions_list.append(alias['FunctionVersion'])
+        untagged_versions = set(available_versions_list) - set(
+            aliased_versions_list) - {'$LATEST'}
+        print("Deleting Untagged Versions")
+        for version in untagged_versions:
+            self.lambda_client.delete_function(FunctionName=lambda_name,
+                                               Qualifier=version)
+
     ##
     # Application load balancer
     ##
@@ -2039,13 +2064,13 @@ class Zappa:
                 continue
             yield api
 
-    def undeploy_api_gateway(self, lambda_name, domain_name=None, base_path=None):
+    def undeploy_api_gateway(self, api_name, api_stage, domain_name=None, base_path=None):
         """
         Delete a deployed REST API Gateway.
         """
         print("Deleting API Gateway..")
 
-        api_id = self.get_api_id(lambda_name)
+        api_id = self.get_api_id(api_name)
 
         if domain_name:
 
@@ -2061,14 +2086,66 @@ class Zappa:
                 # We may not have actually set up the domain.
                 pass
 
-        was_deleted = self.delete_stack(lambda_name, wait=True)
+        remaining_stages_count = self.delete_api_stage(api_id, api_stage)
+        if remaining_stages_count == 0:
+            was_deleted = self.delete_stack(api_name, wait=True)
 
-        if not was_deleted:
-            # try erasing it with the older method
-            for api in self.get_rest_apis(lambda_name):
-                self.apigateway_client.delete_rest_api(
-                    restApiId=api['id']
+            if not was_deleted:
+                # try erasing it with the older method
+                for api in self.get_rest_apis(api_name):
+                    self.apigateway_client.delete_rest_api(
+                        restApiId=api['id']
+                    )
+
+    def get_api_stages(self, api_id):
+        stages_response = self.apigateway_client.get_stages(
+            restApiId=api_id,
+        )
+        return stages_response["item"]
+
+    def get_deployment_id(self, api_id, stage_name):
+        stage_items = self.get_api_stages(api_id)
+        for each_stage in stage_items:
+            if each_stage["stageName"] == stage_name:
+                return each_stage["deploymentId"], len(stage_items)
+        return None, len(stage_items)
+
+    def delete_api_deployment(self, api_id, deployment_id):
+        # todo
+        pass
+
+    def delete_unused_api_deployments(self, api_id):
+        """
+        :param api_id: rest api id to deleted un used api deployments
+        :return:
+        """
+        api_stages = self.get_api_stages(api_id)
+        deployment_ids = []
+        for each_stage in api_stages:
+            deployment_ids.append(each_stage["deploymentId"])
+        deployment_response = self.apigateway_client.get_deployments(
+            restApiId=api_id,
+            limit=500
+        )
+
+        print("Deleting unused API Deployments")
+        for each_deployment in deployment_response["items"]:
+            if each_deployment["id"] not in deployment_ids:
+                self.apigateway_client.delete_deployment(
+                    restApiId=api_id,
+                    deploymentId=each_deployment["id"]
                 )
+
+    def delete_api_stage(self, api_id, stage_name):
+        self.apigateway_client.delete_stage(
+            restApiId=api_id,
+            stageName=stage_name
+        )
+
+        remaining_stages_response = self.apigateway_client.get_stages(
+            restApiId=api_id,
+        )
+        return len(remaining_stages_response["item"])
 
     def update_stage_config(    self,
                                 project_name,
@@ -2171,7 +2248,7 @@ class Zappa:
 
     def create_stack_template(  self,
                                 lambda_arn,
-                                lambda_name,
+                                api_name,
                                 api_key_required,
                                 iam_authorization,
                                 authorizer,
@@ -2203,7 +2280,7 @@ class Zappa:
 
         restapi = self.create_api_gateway_routes(
                                             lambda_arn,
-                                            api_name=lambda_name,
+                                            api_name=api_name,
                                             api_key_required=api_key_required,
                                             authorization_type=auth_type,
                                             authorizer=authorizer,
@@ -2322,22 +2399,22 @@ class Zappa:
             return {}
 
 
-    def get_api_url(self, lambda_name, stage_name):
+    def get_api_url(self, api_name, stage_name):
         """
-        Given a lambda_name and stage_name, return a valid API URL.
+        Given a api_name and stage_name, return a valid API URL.
         """
-        api_id = self.get_api_id(lambda_name)
+        api_id = self.get_api_id(api_name)
         if api_id:
             return "https://{}.execute-api.{}.amazonaws.com/{}".format(api_id, self.boto_session.region_name, stage_name)
         else:
             return None
 
-    def get_api_id(self, lambda_name):
+    def get_api_id(self, api_name):
         """
-        Given a lambda_name, return the API id.
+        Given a api_name, return the API id.
         """
         try:
-            response = self.cf_client.describe_stack_resource(StackName=lambda_name,
+            response = self.cf_client.describe_stack_resource(StackName=api_name,
                                                               LogicalResourceId='Api')
             return response['StackResourceDetail'].get('PhysicalResourceId', None)
         except: # pragma: no cover
@@ -2346,7 +2423,7 @@ class Zappa:
                 response = self.apigateway_client.get_rest_apis(limit=500)
 
                 for item in response['items']:
-                    if item['name'] == lambda_name:
+                    if item['name'] == api_name:
                         return item['id']
 
                 logger.exception('Could not get API ID.')
@@ -2363,6 +2440,7 @@ class Zappa:
                            certificate_chain=None,
                            certificate_arn=None,
                            lambda_name=None,
+                           api_name=None,
                            stage=None,
                            base_path=None):
         """
@@ -2386,7 +2464,7 @@ class Zappa:
                 certificateArn=certificate_arn
             )
 
-        api_id = self.get_api_id(lambda_name)
+        api_id = self.get_api_id(api_name)
         if not api_id:
             raise LookupError("No API URL to certify found - did you deploy?")
 
@@ -2457,7 +2535,7 @@ class Zappa:
                            certificate_private_key=None,
                            certificate_chain=None,
                            certificate_arn=None,
-                           lambda_name=None,
+                           api_name=None,
                            stage=None,
                            route53=True,
                            base_path=None):
@@ -3138,13 +3216,14 @@ class Zappa:
         """
         self.remove_log_group('/aws/lambda/{}'.format(lambda_function_name))
 
-    def remove_api_gateway_logs(self, project_name):
+    def remove_api_gateway_logs(self, project_name, stage_name):
         """
         Removed all logs that are assigned to a given rest api id.
         """
         for rest_api in self.get_rest_apis(project_name):
             for stage in self.apigateway_client.get_stages(restApiId=rest_api['id'])['item']:
-                self.remove_log_group('API-Gateway-Execution-Logs_{}/{}'.format(rest_api['id'], stage['stageName']))
+                if stage_name == stage:
+                    self.remove_log_group('API-Gateway-Execution-Logs_{}/{}'.format(rest_api['id'], stage['stageName']))
 
     ##
     # Route53 Domain Name Entries
