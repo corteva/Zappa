@@ -2439,7 +2439,6 @@ class Zappa:
                            certificate_private_key=None,
                            certificate_chain=None,
                            certificate_arn=None,
-                           lambda_name=None,
                            api_name=None,
                            stage=None,
                            base_path=None):
@@ -2568,7 +2567,7 @@ class Zappa:
                                                                  CertificateChain=certificate_chain)
             certificate_arn = acm_certificate['CertificateArn']
 
-        self.update_domain_base_path_mapping(domain_name, lambda_name, stage, base_path)
+        self.update_domain_base_path_mapping(domain_name, api_name, stage, base_path)
 
         return self.apigateway_client.update_domain_name(domainName=domain_name,
                                                          patchOperations=[
@@ -2579,12 +2578,12 @@ class Zappa:
                                                               "path" : "/certificateArn",
                                                               "value" : certificate_arn}
                                                          ])
-
-    def update_domain_base_path_mapping(self, domain_name, lambda_name, stage, base_path):
+    
+    def update_domain_base_path_mapping(self, domain_name, api_name, stage, base_path):
         """
         Update domain base path mapping on API Gateway if it was changed
         """
-        api_id = self.get_api_id(lambda_name)
+        api_id = self.get_api_id(api_name)
         if not api_id:
             print("Warning! Can't update base path mapping!")
             return
