@@ -846,6 +846,9 @@ to change Zappa's behavior. Use these at your own risk!
         "cloudwatch_log_level": "OFF", // Enables/configures a level of logging for the given staging. Available options: "OFF", "INFO", "ERROR", default "OFF". C
         "cloudwatch_data_trace": false, // Logs all data about received events. Default false.
         "cloudwatch_metrics_enabled": false, // Additional metrics for the API Gateway. Default false.
+        "access_logging": false, // Add in logging of who accesses the API
+        "access_logging_log_format": "See https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-logging.html", // Optional. SON is default if not supplied
+        "access_logging_cloudwatch_group": "arn:aws:logs:{region_name}:{account_id}:log-group:API-Gateway-Access-Logs_{api_id}/{stage_name}", // The ARN of the cloudwatch logs to log to, optional. Default is in the format shown.
         "cognito": { // for Cognito event triggers
             "user_pool": "user-pool-id", // User pool ID from AWS Cognito
             "triggers": [{
