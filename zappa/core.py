@@ -1756,6 +1756,49 @@ class Zappa(object):
         integration.Uri = uri
         method.Integration = integration
 
+    def get_access_logging_patch(self,
+                                 access_logging,
+                                 access_logging_log_format,
+                                 access_logging_cloudwatch_group,
+                                 api_id,
+                                 stage_name):
+        """Get the patch needed for API Gateway Access Logging."""
+        access_logging_patch = []
+        if access_logging:
+            if access_logging_cloudwatch_group is None:
+                access_logging_cloudwatch_group = (
+                    "arn:aws:logs:{region_name}:{account_id}:"
+                    "log-group:API-Gateway-Access-Logs_{api_id}/{stage_name}"
+                ).format(region_name=self.boto_session.region_name,
+                         account_id=self.sts_client.get_caller_identity().get('Account'),
+                         api_id=api_id,
+                         stage_name=stage_name)
+            if access_logging_log_format is None:
+                access_logging_log_format = (
+                    "{ \"requestId\": \"$context.requestId\", "
+                    "\"ip\": \"$context.identity.sourceIp\", "
+                    "\"caller\": \"$context.identity.caller\", "
+                    "\"requestTime\": \"$context.requestTimeEpoch\", "
+                    "\"httpMethod\": \"$context.httpMethod\", "
+                    "\"resourcePath\": \"$context.resourcePath\", "
+                    "\"status\": \"$context.status\", "
+                    "\"protocol\": \"$context.protocol\", "
+                    "\"responseLength\": \"$context.responseLength\" }"
+                )
+            access_logging_patch = [
+                {
+                    "op": "replace",
+                    "path": "/accessLogSettings/format",
+                    "value": access_logging_log_format
+                },
+                {
+                    "op": "replace",
+                    "path": "/accessLogSettings/destinationArn",
+                    "value": access_logging_cloudwatch_group
+                }
+            ]
+        return access_logging_patch
+
     def deploy_api_gateway( self,
                             api_id,
                             stage_name,
@@ -1767,6 +1810,9 @@ class Zappa(object):
                             cloudwatch_log_level='OFF',
                             cloudwatch_data_trace=False,
                             cloudwatch_metrics_enabled=False,
+                            access_logging=False,
+                            access_logging_log_format=None,
+                            access_logging_cloudwatch_group=None,
                             cache_cluster_ttl=300,
                             cache_cluster_encrypted=False
                         ):
@@ -1790,6 +1836,13 @@ class Zappa(object):
         if cloudwatch_log_level not in self.cloudwatch_log_levels:
             cloudwatch_log_level = 'OFF'
 
+        access_logging_patch = self.get_access_logging_patch(
+             access_logging,
+             access_logging_log_format,
+             access_logging_cloudwatch_group,
+             api_id,
+             stage_name)
+
         self.apigateway_client.update_stage(
             restApiId=api_id,
             stageName=stage_name,
@@ -1799,7 +1852,7 @@ class Zappa(object):
                 self.get_patch_op('metrics/enabled', cloudwatch_metrics_enabled),
                 self.get_patch_op('caching/ttlInSeconds', str(cache_cluster_ttl)),
                 self.get_patch_op('caching/dataEncrypted', cache_cluster_encrypted)
-            ]
+            ] + access_logging_patch
         )
 
         return "https://{}.execute-api.{}.amazonaws.com/{}".format(api_id, self.boto_session.region_name, stage_name)
@@ -2026,7 +2079,10 @@ class Zappa(object):
                                 stage_name,
                                 cloudwatch_log_level,
                                 cloudwatch_data_trace,
-                                cloudwatch_metrics_enabled
+                                cloudwatch_metrics_enabled,
+                                access_logging,
+                                access_logging_log_format,
+                                access_logging_cloudwatch_group
                             ):
         """
         Update CloudWatch metrics configuration.
@@ -2035,6 +2091,13 @@ class Zappa(object):
             cloudwatch_log_level = 'OFF'
 
         for api in self.get_rest_apis(project_name):
+            access_logging_patch = self.get_access_logging_patch(
+                access_logging,
+                access_logging_log_format,
+                access_logging_cloudwatch_group,
+                api['id'],
+                stage_name)
+
             self.apigateway_client.update_stage(
                 restApiId=api['id'],
                 stageName=stage_name,
@@ -2042,7 +2105,7 @@ class Zappa(object):
                     self.get_patch_op('logging/loglevel', cloudwatch_log_level),
                     self.get_patch_op('logging/dataTrace', cloudwatch_data_trace),
                     self.get_patch_op('metrics/enabled', cloudwatch_metrics_enabled),
-                ]
+                ] + access_logging_patch
             )
 
     def update_cognito(self, lambda_name, user_pool, lambda_configs, lambda_arn):
