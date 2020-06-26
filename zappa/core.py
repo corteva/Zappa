@@ -31,7 +31,7 @@ from setuptools import find_packages
 import boto3
 import botocore
 import troposphere
-import troposphere.apigateway
+import troposphere.apigatewayv2
 from botocore.exceptions import ClientError
 from tqdm import tqdm
 
@@ -1542,26 +1542,48 @@ class Zappa:
         Returns the new RestAPI CF resource.
         """
 
-        restapi = troposphere.apigateway.RestApi('Api')
-        restapi.Name = api_name or lambda_arn.split(':')[-1]
+        httpapi = troposphere.apigatewayv2.Api('Api')
+        httpapi.ProtocolType = "HTTP"
+        httpapi.Name = api_name or lambda_arn.split(':')[-1]
         if not description:
             description = 'Created automatically by Zappa.'
-        restapi.Description = description
-        endpoint_configuration = [] if endpoint_configuration is None else endpoint_configuration
-        if self.boto_session.region_name == "us-gov-west-1":
-            endpoint_configuration.append("REGIONAL")
-        if endpoint_configuration:
-            endpoint = troposphere.apigateway.EndpointConfiguration()
-            endpoint.Types = list(set(endpoint_configuration))
-            restapi.EndpointConfiguration = endpoint
+        httpapi.Description = description
         if self.apigateway_policy:
-            restapi.Policy = json.loads(self.apigateway_policy)
-        self.cf_template.add_resource(restapi)
+            httpapi.Body = json.loads(self.apigateway_policy)
+        if cors_options:
+            httpapi.CorsConfiguation = {
+                "allow_headers": cors_options.get(
+                    "allowed_headers",
+                    [
+                        "Content-Type",
+                        "X-Amz-Date",
+                        "Authorization",
+                        "X-Api-Key",
+                        "X-Amz-Security-Token"
+                     ],
+                ),
+                "allow_methods": cors_options.get(
+                    "allowed_methods",
+                    ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+                ),
+                "allow_origins": [cors_options.get("allowed_origin", "*")],
+            }
+        self.cf_template.add_resource(httpapi)
 
-        root_id = troposphere.GetAtt(restapi, 'RootResourceId')
+        root_id = troposphere.GetAtt(httpapi, 'RootResourceId')
         invocation_prefix = "aws" if self.boto_session.region_name != "us-gov-west-1" else "aws-us-gov"
         invocations_uri = 'arn:' + invocation_prefix + ':apigateway:' + self.boto_session.region_name + ':lambda:path/2015-03-31/functions/' + lambda_arn + '/invocations'
 
+        integration = troposphere.apigatewayv2.Integration('Integration')
+        integration.ApiId = troposphere.Ref(httpapi)
+        integration.Description = "Zappa Lambda Integration"
+        integration.IntegrationType = "AWS_PROXY"
+        integration.IntegrationMethods = "POST"
+        integration.PassthroughBehavior = "NEVER"
+        integration.PayloadFormatVersion = "1.0"
+        integration.IntegrationUri = invocations_uri
+        if not self.credentials_arn:
+            self.get_credentials_arn()
         ##
         # The Resources
         ##
@@ -1574,10 +1596,10 @@ class Zappa:
                 lambda_arn=authorizer_lambda_arn
             )
             authorizer_resource = self.create_authorizer(
-                restapi, lambda_uri, authorizer
+                httpapi, lambda_uri, authorizer
             )
 
-        self.create_and_setup_methods(  restapi,
+        self.create_and_setup_methods(  httpapi,
                                         root_id,
                                         api_key_required,
                                         invocations_uri,
@@ -1586,22 +1608,14 @@ class Zappa:
                                         0
                                         )
 
-        if cors_options:
-            self.create_and_setup_cors( restapi,
-                                        root_id,
-                                        invocations_uri,
-                                        0,
-                                        cors_options
-                                    )
-
         resource = troposphere.apigateway.Resource('ResourceAnyPathSlashed')
         self.cf_api_resources.append(resource.title)
-        resource.RestApiId = troposphere.Ref(restapi)
+        resource.RestApiId = troposphere.Ref(httpapi)
         resource.ParentId = root_id
         resource.PathPart = "{proxy+}"
         self.cf_template.add_resource(resource)
 
-        self.create_and_setup_methods(  restapi,
+        self.create_and_setup_methods(  httpapi,
                                         resource,
                                         api_key_required,
                                         invocations_uri,
@@ -1610,38 +1624,38 @@ class Zappa:
                                         1
                                     )  # pragma: no cover
 
-        if cors_options:
-            self.create_and_setup_cors( restapi,
-                                        resource,
-                                        invocations_uri,
-                                        1,
-                                        cors_options
-                                    )  # pragma: no cover
-        return restapi
+        return httpapi
 
-    def create_authorizer(self, restapi, uri, authorizer):
+    def create_authorizer(self, httpapi, uri, authorizer):
         """
         Create Authorizer for API gateway
         """
         authorizer_type = authorizer.get("type", "TOKEN").upper()
-        identity_validation_expression = authorizer.get('validation_expression', None)
-
-        authorizer_resource = troposphere.apigateway.Authorizer("Authorizer")
-        authorizer_resource.RestApiId = troposphere.Ref(restapi)
+        authorizer_resource = troposphere.apigatewayv2.Authorizer("Authorizer")
+        authorizer_resource.ApiId = troposphere.Ref(httpapi)
         authorizer_resource.Name = authorizer.get("name", "ZappaAuthorizer")
-        authorizer_resource.Type = authorizer_type
+        authorizer_resource.AuthorizerType = authorizer_type
         authorizer_resource.AuthorizerUri = uri
-        authorizer_resource.IdentitySource = "method.request.header.%s" % authorizer.get('token_header', 'Authorization')
+        if authorizer_type == "JWT":
+            authorizer_resource.IdentitySource = [
+                "$request.header.%s" % authorizer.get('token_header', 'Authorization')
+            ]
+        else:
+            authorizer_resource.IdentitySource = [
+                "route.request.header.%s" % authorizer.get('token_header', 'Authorization')
+            ]
+        identity_validation_expression = authorizer.get('validation_expression', None)
         if identity_validation_expression:
             authorizer_resource.IdentityValidationExpression = identity_validation_expression
-
         if authorizer_type == 'TOKEN':
             if not self.credentials_arn:
                 self.get_credentials_arn()
             authorizer_resource.AuthorizerResultTtlInSeconds = authorizer.get('result_ttl', 300)
-            authorizer_resource.AuthorizerCredentials = self.credentials_arn
-        if authorizer_type == 'COGNITO_USER_POOLS':
-            authorizer_resource.ProviderARNs = authorizer.get('provider_arns')
+            authorizer_resource.AuthorizerCredentialsArn = self.credentials_arn
+        elif authorizer_type == 'COGNITO_USER_POOLS':
+            raise RuntimeError("COGNITO_USER_POOLS authorizer is replaced by JWT")
+        elif authorizer_type == "JWT":
+            authorizer_resource.JwtConfiguration = authorizer['jwt_configuration']
 
         self.cf_api_resources.append(authorizer_resource.title)
         self.cf_template.add_resource(authorizer_resource)
@@ -1650,7 +1664,7 @@ class Zappa:
 
     def create_and_setup_methods(
                                     self,
-                                    restapi,
+                                    httpapi,
                                     resource,
                                     api_key_required,
                                     uri,
@@ -1662,9 +1676,9 @@ class Zappa:
         Set up the methods, integration responses and method responses for a given API Gateway resource.
         """
         for method_name in self.http_methods:
-            method = troposphere.apigateway.Method(method_name + str(depth))
-            method.RestApiId = troposphere.Ref(restapi)
-            if type(resource) is troposphere.apigateway.Resource:
+            route = troposphere.apigatewayv2.Route(method_name + str(depth))
+            route.RestApiId = troposphere.Ref(httpapi)
+            if type(resource) is troposphere.apigatewayv2.Resource:
                 method.ResourceId = troposphere.Ref(resource)
             else:
                 method.ResourceId = resource
@@ -1676,81 +1690,6 @@ class Zappa:
             method.MethodResponses = []
             self.cf_template.add_resource(method)
             self.cf_api_resources.append(method.title)
-
-            if not self.credentials_arn:
-                self.get_credentials_arn()
-            credentials = self.credentials_arn  # This must be a Role ARN
-
-            integration = troposphere.apigateway.Integration()
-            integration.CacheKeyParameters = []
-            integration.CacheNamespace = 'none'
-            integration.Credentials = credentials
-            integration.IntegrationHttpMethod = 'POST'
-            integration.IntegrationResponses = []
-            integration.PassthroughBehavior = 'NEVER'
-            integration.Type = 'AWS_PROXY'
-            integration.Uri = uri
-            method.Integration = integration
-
-    def create_and_setup_cors(self, restapi, resource, uri, depth, config):
-        """
-        Set up the methods, integration responses and method responses for a given API Gateway resource.
-        """
-        if config is True:
-            config = {}
-        method_name = "OPTIONS"
-        method = troposphere.apigateway.Method(method_name + str(depth))
-        method.RestApiId = troposphere.Ref(restapi)
-        if type(resource) is troposphere.apigateway.Resource:
-            method.ResourceId = troposphere.Ref(resource)
-        else:
-            method.ResourceId = resource
-        method.HttpMethod = method_name.upper()
-        method.AuthorizationType = "NONE"
-        method_response = troposphere.apigateway.MethodResponse()
-        method_response.ResponseModels = {
-            "application/json": "Empty"
-        }
-        response_headers = {
-            "Access-Control-Allow-Headers": "'%s'" % ",".join(config.get(
-                "allowed_headers", ["Content-Type", "X-Amz-Date",
-                                    "Authorization", "X-Api-Key",
-                                    "X-Amz-Security-Token"])),
-            "Access-Control-Allow-Methods": "'%s'" % ",".join(config.get(
-                "allowed_methods", ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"])),
-            "Access-Control-Allow-Origin": "'%s'" % config.get(
-                "allowed_origin", "*")
-        }
-        method_response.ResponseParameters = {
-            "method.response.header.%s" % key: True for key in response_headers
-        }
-        method_response.StatusCode = "200"
-        method.MethodResponses = [
-            method_response
-        ]
-        self.cf_template.add_resource(method)
-        self.cf_api_resources.append(method.title)
-
-        integration = troposphere.apigateway.Integration()
-        integration.Type = 'MOCK'
-        integration.PassthroughBehavior = 'NEVER'
-        integration.RequestTemplates = {
-            "application/json": "{\"statusCode\": 200}"
-        }
-        integration_response = troposphere.apigateway.IntegrationResponse()
-        integration_response.ResponseParameters = {
-            "method.response.header.%s" % key: value for key, value in response_headers.items()
-        }
-        integration_response.ResponseTemplates = {
-            "application/json": ""
-        }
-        integration_response.StatusCode = "200"
-        integration.IntegrationResponses = [
-            integration_response
-        ]
-
-        integration.Uri = uri
-        method.Integration = integration
 
     def deploy_api_gateway( self,
                             api_id,
@@ -2138,7 +2077,7 @@ class Zappa:
         self.cf_api_resources = []
         self.cf_parameters = {}
 
-        restapi = self.create_api_gateway_routes(
+        httpapi = self.create_api_gateway_routes(
                                             lambda_arn,
                                             api_name=lambda_name,
                                             api_key_required=api_key_required,
