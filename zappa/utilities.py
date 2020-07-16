@@ -580,4 +580,5 @@ def merge_headers(event):
             multi_headers[h] = [headers[h]]
     for h in multi_headers.keys():
         multi_headers[h] = ', '.join(multi_headers[h])
+    LOG.debug('merge_headers: {}'.format(multi_headers))
     return multi_headers

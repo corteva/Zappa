@@ -560,10 +560,12 @@ class LambdaHandler:
                         zappa_returndict['headers'] = {}
                         for key, value in response.headers:
                             zappa_returndict['headers'][key] = value
+                        logger.info("headers added to zappa returndict: {}".format(zappa_returndict['headers']))
                     if 'multiValueHeaders' in event:
                         zappa_returndict['multiValueHeaders'] = {}
                         for key, value in response.headers:
                             zappa_returndict['multiValueHeaders'][key] = response.headers.getlist(key)
+                        logger.info("multiValueHeaders added to zappa returndict: {}".format(zappa_returndict['multiValueHeaders']))
 
                     # Calculate the total response time,
                     # and log it in the Common Log format.
